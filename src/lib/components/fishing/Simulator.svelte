@@ -2,7 +2,8 @@
 	import { FISH_DATA, FISH_BY_NAME, AREA_ORDER, PERIODS } from '$lib/data/fish.js';
 	import { hexToRgba } from '$lib/color.js';
 	import {
-		runSession, runSpecies, runFp, analyticalSizeDistribution, normalCdf
+		runSession, runSpecies, runFp, normalCdf, predictedProbs,
+		ARISE_STRENGTH, ARISE_EXPONENT
 	} from '$lib/sim/fishing.js';
 	import { customFish } from '$lib/fishingState.svelte.js';
 	import ChartCanvas from '$lib/components/ChartCanvas.svelte';
@@ -40,6 +41,10 @@
 	let fpSize = $state(100);
 	let fpResult = $state(null);
 
+	// Arise Mardan (romhack) size smoothing — shared across Session & Species.
+	// On/off; the buff strength/shape are locked constants (ARISE_STRENGTH/EXPONENT).
+	let arise = $state({ enabled: false });
+
 	// ── Modal state ──
 	let modal = $state({ open: false, title: '', mode: 'loading', data: null, error: '' });
 	let zoom = $state(1);
@@ -70,10 +75,11 @@
 				order: 2
 			});
 		});
+		const ar = modal.data.arise;
 		sortedIds.forEach((id) => {
 			const f = fishById[id];
 			const n = spawnCounts[id] || 0;
-			const probs = analyticalSizeDistribution(f);
+			const probs = predictedProbs(f, ar);
 			datasets.push({
 				type: 'line',
 				label: f.name + ' (predicted)',
@@ -160,14 +166,22 @@
 		}
 	};
 
-	function formulaHtml(fish) {
+	function formulaHtml(fish, arise) {
 		const b = fish.baseSize, mn = fish.minSize, mx = fish.maxSize, r = mx - b, fl = b * 0.5;
+		const head = `<strong>Fish stats:</strong>
+			BaseSize=${b} | MinSize=${mn} | MaxSize=${mx} | Range=${r} | BaseFP=${fish.baseFp} | MaxFP=${fish.maxFp}<br>
+			<strong>RNG:</strong> r &sim; IH(12)&minus;6 &nbsp; (range (&minus;6,6), mean=0, &sigma;=1)<br>`;
+
+		if (arise && arise.enabled) {
+			return `${head}
+				<strong>Arise Mardan smoothing:</strong> size-based buff, t = (size&minus;Base)/(Max&minus;Base)<br>
+				size → size + ${ARISE_STRENGTH}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t) &nbsp; (upper range only)<br>
+				<strong>Effect:</strong> fish only get bigger; Max is preserved (no probability pulled from it); mid/high sizes buffed up to fill the gradient into Max`;
+		}
+
 		const rngFloor = (((fl - b) * 8) / r).toFixed(2);
 		const rngMaxUp = (((mx - b) * 4) / r).toFixed(2);
-		return `
-			<strong>Fish stats:</strong>
-			BaseSize=${b} | MinSize=${mn} | MaxSize=${mx} | Range=${r} | BaseFP=${fish.baseFp} | MaxFP=${fish.maxFp}<br>
-			<strong>RNG:</strong> r &sim; IH(12)&minus;6 &nbsp; (range (&minus;6,6), mean=0, &sigma;=1)<br>
+		return `${head}
 			<strong>Size:</strong> BaseSize + r &times; Range / {4 if r&ge;0, 8 if r&lt;0} &nbsp; clamped to [${fl}, ${mx}]<br>
 			<strong>Floor clamp:</strong> r &lt; ${rngFloor} (P&asymp;${(100 * normalCdf(parseFloat(rngFloor))).toFixed(3)}%)
 			&nbsp;&nbsp;
@@ -179,7 +193,12 @@
 		modal = { open: true, title: 'Session Simulator — ' + sessArea, mode: 'loading', data: null, error: '' };
 		zoom = 1;
 		setTimeout(() => {
-			const result = runSession({ areaName: sessArea, periodName: sessPeriod, numSessions: sessCount });
+			const result = runSession({
+				areaName: sessArea,
+				periodName: sessPeriod,
+				numSessions: sessCount,
+				arise: { enabled: arise.enabled }
+			});
 			if (!result.ok) modal = { ...modal, mode: 'error', error: result.message };
 			else modal = { open: true, title: 'Session Simulator — ' + sessArea, mode: 'session', data: result, error: '' };
 		}, 20);
@@ -189,7 +208,11 @@
 		const fish = getFish(specFish);
 		modal = { open: true, title: 'Species Simulator — ' + specFish, mode: 'loading', data: null, error: '' };
 		setTimeout(() => {
-			const result = runSpecies({ fish, numFish: specCount });
+			const result = runSpecies({
+				fish,
+				numFish: specCount,
+				arise: { enabled: arise.enabled }
+			});
 			if (!result.ok) modal = { ...modal, mode: 'error', error: result.message };
 			else modal = { open: true, title: 'Species Simulator — ' + specFish, mode: 'species', data: result, error: '' };
 		}, 20);
@@ -202,6 +225,15 @@
 </script>
 
 <svelte:window onkeydown={onKey} />
+
+{#snippet ariseControl()}
+	<div class="sim-row arise-row">
+		<label class="arise-label">
+			<input type="checkbox" bind:checked={arise.enabled} />
+			Arise Mardan smoothing
+		</label>
+	</div>
+{/snippet}
 
 <div class="card">
 	<div class="card-header">🎣 Fishing Simulator</div>
@@ -230,6 +262,7 @@
 					<label for="sess-count">Sessions</label>
 					<input id="sess-count" class="sim-input" type="number" min="1" max="100000" bind:value={sessCount} />
 				</div>
+				{@render ariseControl()}
 				<button class="generate-btn" onclick={generateSession}>▶ Generate</button>
 			</div>
 		{:else if tab === 'species'}
@@ -244,6 +277,7 @@
 					<label for="spec-count">Number of Fish</label>
 					<input id="spec-count" class="sim-input" type="number" min="1" max="500000" bind:value={specCount} />
 				</div>
+				{@render ariseControl()}
 				<button class="generate-btn" onclick={generateSpecies}>▶ Generate</button>
 			</div>
 		{:else}
@@ -306,7 +340,7 @@
 					<div class="error-msg">Error: {modal.error}</div>
 				{:else if modal.mode === 'session' && sessionChartData}
 					<div class="modal-sub">
-						{modal.data.periodName} · {modal.data.numSess} sessions · stacked bars = Monte Carlo · lines = predicted
+						{modal.data.periodName} · {modal.data.numSess} sessions · stacked bars = Monte Carlo · lines = predicted{#if modal.data.arise?.enabled} · <strong>Arise Mardan smoothing</strong>{/if}
 					</div>
 					<div class="chart-row">
 						<div class="chart-wrap">
@@ -341,11 +375,11 @@
 					</table>
 				{:else if modal.mode === 'species' && speciesChartData}
 					<div class="modal-sub">
-						n = {modal.data.numFish.toLocaleString()} · bars = Monte Carlo · line = predicted
+						n = {modal.data.numFish.toLocaleString()} · bars = Monte Carlo · line = predicted{#if modal.data.arise?.enabled} · <strong>Arise Mardan smoothing</strong>{/if}
 					</div>
 					<ChartCanvas type="bar" data={speciesChartData} options={speciesOptions} />
 					<!-- eslint-disable-next-line svelte/no-at-html-tags (our own generated, trusted string) -->
-					<div class="formula-box">{@html formulaHtml(modal.data.fish)}</div>
+					<div class="formula-box">{@html formulaHtml(modal.data.fish, modal.data.arise)}</div>
 					<table class="result-table">
 						<thead>
 							<tr><th>Statistic</th><th>Value</th><th>FP</th><th>Count</th></tr>
@@ -419,6 +453,35 @@
 	.sim-input:focus {
 		outline: 2px solid var(--blue);
 		border-color: var(--blue);
+	}
+	.arise-row {
+		gap: 16px;
+		padding: 8px 12px;
+		background: #f3f6fb;
+		border: 1px solid #dbe4f0;
+		border-radius: 5px;
+	}
+	.arise-label {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: auto;
+		cursor: pointer;
+	}
+	.arise-label input {
+		width: 16px;
+		height: 16px;
+		cursor: pointer;
+	}
+	.arise-factor {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-weight: bold;
+	}
+	.factor-input {
+		min-width: 80px;
+		width: 80px;
 	}
 	.generate-btn {
 		background: var(--orange);
