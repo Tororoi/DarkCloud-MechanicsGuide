@@ -8,6 +8,15 @@ export const BAIT_NAMES = [
 	'Banana', 'Carrot', 'Potato', 'Minon', 'Battan', 'Petite'
 ];
 
+// Notice-radius copied into each fish slot when the matching bait is equipped.
+// Values from the EE RAM bait detection-radius table (confirmed 2026-06-03).
+// Keyed by BAIT_NAMES; a larger radius means fish notice the bait from farther.
+export const BAIT_RADIUS = {
+	Evy: 128.0, Mimi: 50.0, Prickly: 25.0, Cherry: 25.0, Peach: 25.0,
+	Bomb: 25.0, Poison: 25.0, Banana: 25.0, Carrot: 25.0, Potato: 25.0,
+	Minon: 25.0, Battan: 25.0, Petite: 25.0
+};
+
 export const PERIODS = ['Morning', 'Afternoon', 'Dusk', 'Night'];
 export const PERIOD_COLORS = ['#fffde7', '#e0f2f1', '#ffe0b2', '#ede7f6'];
 
