@@ -2,7 +2,9 @@
 	import { FISH_DATA, FISH_BY_NAME, AREA_ORDER, PERIODS } from '$lib/data/fish.js';
 	import { hexToRgba } from '$lib/color.js';
 	import {
-		runSession, runSpecies, runFp, analyticalSizeDistribution, normalCdf
+		runSession, runSpecies, runFp, normalCdf, predictedProbs,
+		ARISE_STRENGTH, ARISE_EXPONENT, ARISE_SCALE_FACTOR,
+		ARISE_SCALED_STRENGTH, ARISE_SCALED_EXPONENT, MAX_FISH_SAMPLES
 	} from '$lib/sim/fishing.js';
 	import { customFish } from '$lib/fishingState.svelte.js';
 	import ChartCanvas from '$lib/components/ChartCanvas.svelte';
@@ -40,6 +42,13 @@
 	let fpSize = $state(100);
 	let fpResult = $state(null);
 
+	// Mod features (romhack). Two independent toggles:
+	//   smoothNative — native smoothing only (0.93/1.2).
+	//   ariseScaling — full Arise pipeline (native smooth → ×2 scale → scaled
+	//     smooth 0.72/2). Always includes native smoothing, regardless of the
+	//     smoothNative toggle.
+	let mod = $state({ smoothNative: false, ariseScaling: false });
+
 	// ── Modal state ──
 	let modal = $state({ open: false, title: '', mode: 'loading', data: null, error: '' });
 	let zoom = $state(1);
@@ -70,10 +79,11 @@
 				order: 2
 			});
 		});
+		const ar = modal.data.mod;
 		sortedIds.forEach((id) => {
 			const f = fishById[id];
 			const n = spawnCounts[id] || 0;
-			const probs = analyticalSizeDistribution(f);
+			const probs = predictedProbs(f, ar);
 			datasets.push({
 				type: 'line',
 				label: f.name + ' (predicted)',
@@ -160,14 +170,37 @@
 		}
 	};
 
-	function formulaHtml(fish) {
+	function modLabel(m) {
+		if (m && m.ariseScaling) return `Arise Mardan ×${m.factor}`;
+		if (m && m.smoothNative) return 'Smooth Native';
+		return '';
+	}
+
+	function formulaHtml(fish, mod) {
 		const b = fish.baseSize, mn = fish.minSize, mx = fish.maxSize, r = mx - b, fl = b * 0.5;
+		const head = `<strong>Fish stats:</strong>
+			BaseSize=${b} | MinSize=${mn} | MaxSize=${mx} | Range=${r} | BaseFP=${fish.baseFp} | MaxFP=${fish.maxFp}<br>
+			<strong>RNG:</strong> r &sim; IH(12)&minus;6 &nbsp; (range (&minus;6,6), mean=0, &sigma;=1)<br>`;
+
+		if (mod && mod.ariseScaling) {
+			const cap = (ARISE_SCALE_FACTOR * mx).toFixed(1);
+			return `${head}
+				<strong>🛠 Arise Mardan Scaling — native size in, then:</strong><br>
+				1. Smooth native: ${ARISE_STRENGTH}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t)<br>
+				2. Scale ×${ARISE_SCALE_FACTOR} (linear): &times;(1 + (${ARISE_SCALE_FACTOR}&minus;1)&middot;u), u=(size&minus;Min)/(Max&minus;Min) → cap ${cap}<br>
+				3. Smooth scaled: ${ARISE_SCALED_STRENGTH}&middot;(Cap&minus;ScaledBase)&middot;t<sup>${ARISE_SCALED_EXPONENT}</sup>&middot;(1&minus;t)<br>
+				<strong>Effect:</strong> floor unscaled, cap = ${cap} (${ARISE_SCALE_FACTOR}&times;Max), smooth gradient into the cap`;
+		}
+
+		if (mod && mod.smoothNative) {
+			return `${head}
+				<strong>🛠 Smooth Native Fish Size Distribution:</strong> size + ${ARISE_STRENGTH}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t), t=(size&minus;Base)/(Max&minus;Base)<br>
+				<strong>Effect:</strong> fish only get bigger; Max preserved; mid/high sizes buffed up to fill the gradient into Max (no scaling)`;
+		}
+
 		const rngFloor = (((fl - b) * 8) / r).toFixed(2);
 		const rngMaxUp = (((mx - b) * 4) / r).toFixed(2);
-		return `
-			<strong>Fish stats:</strong>
-			BaseSize=${b} | MinSize=${mn} | MaxSize=${mx} | Range=${r} | BaseFP=${fish.baseFp} | MaxFP=${fish.maxFp}<br>
-			<strong>RNG:</strong> r &sim; IH(12)&minus;6 &nbsp; (range (&minus;6,6), mean=0, &sigma;=1)<br>
+		return `${head}
 			<strong>Size:</strong> BaseSize + r &times; Range / {4 if r&ge;0, 8 if r&lt;0} &nbsp; clamped to [${fl}, ${mx}]<br>
 			<strong>Floor clamp:</strong> r &lt; ${rngFloor} (P&asymp;${(100 * normalCdf(parseFloat(rngFloor))).toFixed(3)}%)
 			&nbsp;&nbsp;
@@ -179,7 +212,12 @@
 		modal = { open: true, title: 'Session Simulator — ' + sessArea, mode: 'loading', data: null, error: '' };
 		zoom = 1;
 		setTimeout(() => {
-			const result = runSession({ areaName: sessArea, periodName: sessPeriod, numSessions: sessCount });
+			const result = runSession({
+				areaName: sessArea,
+				periodName: sessPeriod,
+				numSessions: sessCount,
+				mod: { smoothNative: mod.smoothNative, ariseScaling: mod.ariseScaling }
+			});
 			if (!result.ok) modal = { ...modal, mode: 'error', error: result.message };
 			else modal = { open: true, title: 'Session Simulator — ' + sessArea, mode: 'session', data: result, error: '' };
 		}, 20);
@@ -187,9 +225,14 @@
 
 	function generateSpecies() {
 		const fish = getFish(specFish);
+		if (Number(specCount) > MAX_FISH_SAMPLES) specCount = MAX_FISH_SAMPLES; // cap (too slow above)
 		modal = { open: true, title: 'Species Simulator — ' + specFish, mode: 'loading', data: null, error: '' };
 		setTimeout(() => {
-			const result = runSpecies({ fish, numFish: specCount });
+			const result = runSpecies({
+				fish,
+				numFish: specCount,
+				mod: { smoothNative: mod.smoothNative, ariseScaling: mod.ariseScaling }
+			});
 			if (!result.ok) modal = { ...modal, mode: 'error', error: result.message };
 			else modal = { open: true, title: 'Species Simulator — ' + specFish, mode: 'species', data: result, error: '' };
 		}, 20);
@@ -202,6 +245,20 @@
 </script>
 
 <svelte:window onkeydown={onKey} />
+
+{#snippet modControls()}
+	<div class="sim-row arise-row">
+		<span class="mod-tag">🛠 Mod features</span>
+		<label class="arise-label" title="Apply the native size-distribution smoothing (0.93/1.2). Does nothing extra when Arise Mardan Scaling is on.">
+			<input type="checkbox" bind:checked={mod.smoothNative} />
+			Smooth Native Fish Size Distribution
+		</label>
+		<label class="arise-label" title="Full Arise Mardan effect: native smooth → ×2 scale → scaled smooth (0.72/2). Always includes native smoothing.">
+			<input type="checkbox" bind:checked={mod.ariseScaling} />
+			Arise Mardan Scaling
+		</label>
+	</div>
+{/snippet}
 
 <div class="card">
 	<div class="card-header">🎣 Fishing Simulator</div>
@@ -230,6 +287,7 @@
 					<label for="sess-count">Sessions</label>
 					<input id="sess-count" class="sim-input" type="number" min="1" max="100000" bind:value={sessCount} />
 				</div>
+				{@render modControls()}
 				<button class="generate-btn" onclick={generateSession}>▶ Generate</button>
 			</div>
 		{:else if tab === 'species'}
@@ -242,8 +300,9 @@
 				</div>
 				<div class="sim-row">
 					<label for="spec-count">Number of Fish</label>
-					<input id="spec-count" class="sim-input" type="number" min="1" max="500000" bind:value={specCount} />
+					<input id="spec-count" class="sim-input" type="number" min="1" max={MAX_FISH_SAMPLES} bind:value={specCount} />
 				</div>
+				{@render modControls()}
 				<button class="generate-btn" onclick={generateSpecies}>▶ Generate</button>
 			</div>
 		{:else}
@@ -306,7 +365,7 @@
 					<div class="error-msg">Error: {modal.error}</div>
 				{:else if modal.mode === 'session' && sessionChartData}
 					<div class="modal-sub">
-						{modal.data.periodName} · {modal.data.numSess} sessions · stacked bars = Monte Carlo · lines = predicted
+						{modal.data.periodName} · {modal.data.numSess} sessions · stacked bars = Monte Carlo · lines = predicted{#if modLabel(modal.data.mod)} · <strong>{modLabel(modal.data.mod)}</strong>{/if}
 					</div>
 					<div class="chart-row">
 						<div class="chart-wrap">
@@ -341,11 +400,11 @@
 					</table>
 				{:else if modal.mode === 'species' && speciesChartData}
 					<div class="modal-sub">
-						n = {modal.data.numFish.toLocaleString()} · bars = Monte Carlo · line = predicted
+						n = {modal.data.numFish.toLocaleString()} · bars = Monte Carlo · line = predicted{#if modLabel(modal.data.mod)} · <strong>{modLabel(modal.data.mod)}</strong>{/if}
 					</div>
 					<ChartCanvas type="bar" data={speciesChartData} options={speciesOptions} />
 					<!-- eslint-disable-next-line svelte/no-at-html-tags (our own generated, trusted string) -->
-					<div class="formula-box">{@html formulaHtml(modal.data.fish)}</div>
+					<div class="formula-box">{@html formulaHtml(modal.data.fish, modal.data.mod)}</div>
 					<table class="result-table">
 						<thead>
 							<tr><th>Statistic</th><th>Value</th><th>FP</th><th>Count</th></tr>
@@ -419,6 +478,44 @@
 	.sim-input:focus {
 		outline: 2px solid var(--blue);
 		border-color: var(--blue);
+	}
+	.arise-row {
+		gap: 16px;
+		padding: 8px 12px;
+		background: #fff4e6;
+		border: 1px solid #ffd8a8;
+		border-radius: 5px;
+	}
+	.mod-tag {
+		font-size: 11px;
+		font-weight: bold;
+		color: #e65100;
+		background: #ffe8cc;
+		padding: 2px 8px;
+		border-radius: 10px;
+		white-space: nowrap;
+	}
+	.arise-label {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-width: auto;
+		cursor: pointer;
+	}
+	.arise-label input {
+		width: 16px;
+		height: 16px;
+		cursor: pointer;
+	}
+	.arise-factor {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-weight: bold;
+	}
+	.factor-input {
+		min-width: 80px;
+		width: 80px;
 	}
 	.generate-btn {
 		background: var(--orange);
