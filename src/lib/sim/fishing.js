@@ -185,57 +185,125 @@ export function analyticalSizeDistribution(fish) {
 // The buff is 0 at base and at max and peaks at t = EXPONENT/(EXPONENT+1). The
 // exponent > 1 gives zero slope at base (f'(base) = 1), so the region just above
 // base isn't stretched — no dip there. Tuned and locked to these constants.
+// Locked constants for smoothing the NATIVE size distribution.
 export const ARISE_STRENGTH = 0.93
 export const ARISE_EXPONENT = 1.2
 
-export function ariseSmoothSize(fish, size) {
-  const base = fish.baseSize
-  const max = fish.maxSize
-  if (size <= base || max <= base) return size
+// Core smoothing buff over an arbitrary [base, max] range: nudges mid/high sizes
+// up toward max to fill the gradient into it, while keeping f(base)=base and
+// f(max)=max. exponent > 1 → zero slope at base (no dip there).
+//   t = (size - base) / (max - base)
+//   f = size + strength * (max - base) * t^exponent * (1 - t)
+export function smoothCore(size, base, max, strength, exponent) {
+  if (strength <= 0 || max <= base || size <= base) return size
   const t = Math.min(1, (size - base) / (max - base))
-  return size + ARISE_STRENGTH * (max - base) * Math.pow(t, ARISE_EXPONENT) * (1 - t)
+  return size + strength * (max - base) * Math.pow(t, exponent) * (1 - t)
 }
 
-// Redistribute a per-cm distribution through a monotonic size map (size units
-// in/out), spreading each source bucket across the destination buckets it
-// covers so the result stays smooth (no combing).
-export function remapProbs(probs, sizeMap) {
+// Native smoothing with the locked constants.
+export function ariseSmoothSize(fish, size) {
+  return smoothCore(size, fish.baseSize, fish.maxSize, ARISE_STRENGTH, ARISE_EXPONENT)
+}
+
+// ── Arise Mardan scaling ──────────────────────────────────────
+// Gradual linear scaling: the multiplier ramps from 1x at MinSize (no scaling)
+// to `factor`x at MaxSize, so the cap rises to maxSize*factor and the floor is
+// untouched.   t = (size - min) / (max - min);   scaled = size * (1 + (factor-1)*t)
+export function ariseScaleSize(fish, size, factor) {
+  const min = fish.minSize
+  const max = fish.maxSize
+  if (factor <= 1 || max <= min) return size
+  const t = (size - min) / (max - min)
+  return size * (1 + (factor - 1) * t)
+}
+
+// Hard cap on the Species-simulator sample count (higher gets too slow to load).
+export const MAX_FISH_SAMPLES = 10_000_000
+
+// Locked Arise pipeline constants.
+export const ARISE_SCALE_FACTOR = 2 // cap = maxSize * 2
+export const ARISE_SCALED_STRENGTH = 0.72 // smoothing applied AFTER scaling
+export const ARISE_SCALED_EXPONENT = 2
+
+// Full Arise transform on a native (already [min,max]-clamped) size:
+//   native smooth (0.93/1.2) → ×2 scale → smooth the scaled range (0.72/2).
+// The native smooth fills the native gradient; scaling raises the cap to 2×max
+// and spreads the upper range (re-exposing the max clamp lump); the scaled
+// smooth (over [scaledBase, scaledMax]) re-fills the gradient into the new cap.
+export function ariseTransform(fish, size) {
+  let s = Math.min(size, fish.maxSize) // native size is clamped to max upstream
+  s = ariseSmoothSize(fish, s)
+  s = ariseScaleSize(fish, s, ARISE_SCALE_FACTOR)
+  const scaledBase = ariseScaleSize(fish, fish.baseSize, ARISE_SCALE_FACTOR)
+  const scaledMax = fish.maxSize * ARISE_SCALE_FACTOR
+  return smoothCore(s, scaledBase, scaledMax, ARISE_SCALED_STRENGTH, ARISE_SCALED_EXPONENT)
+}
+
+// Native continuous size density (per size unit) at `size`, normal-approx IH.
+// Excludes the floor/cap clamp point masses (handled separately).
+export function nativeSizePdf(fish, size) {
+  const base = fish.baseSize
+  const max_ = fish.maxSize
+  const range = max_ - base
+  const floor_ = 0.5 * base
+  if (range <= 0 || size < floor_ || size > max_) return 0
+  return size >= base
+    ? ihPdf(((size - base) * 4) / range) * (4 / range)
+    : ihPdf(((size - base) * 8) / range) * (8 / range)
+}
+
+// Source resolution for the Arise predicted curve. The game stores size as a
+// 4-decimal float (display cm = floor(size*10)), so we model at that precision
+// rather than 1cm — this also avoids the staircase a 1cm-source remap produces
+// once scaling stretches the range.
+const ARISE_PDF_STEP = 1e-4 // size units (4 decimal places)
+
+// Integrate the native density at 4-decimal precision, push each slice through a
+// size map, and bin to cm by floor (matching the game's display). Shared by the
+// native-smooth and Arise predicted curves.
+function mappedSizeDistribution(fish, mapFn) {
+  const base = fish.baseSize
+  const max_ = fish.maxSize
+  const range = max_ - base
+  const floor_ = 0.5 * base
   const out = {}
-  for (const cmStr in probs) {
-    const p = probs[cmStr]
-    if (!p) continue
-    const cm = +cmStr
-    const loC = sizeMap(cm / 10) * 10
-    const hiC = sizeMap((cm + 1) / 10) * 10
-    const span = hiC - loC
-    if (span <= 1e-9) {
-      const k = Math.round(loC)
-      out[k] = (out[k] || 0) + p
-      continue
-    }
-    let c = Math.floor(loC)
-    while (c < hiC) {
-      const segLo = Math.max(loC, c)
-      const segHi = Math.min(hiC, c + 1)
-      const frac = (segHi - segLo) / span
-      if (frac > 0) out[c] = (out[c] || 0) + p * frac
-      c++
-    }
+  if (range <= 0) return out
+
+  const add = (size, p) => {
+    if (p <= 0) return
+    const cm = Math.floor(mapFn(size) * 10)
+    out[cm] = (out[cm] || 0) + p
   }
+
+  const h = ARISE_PDF_STEP
+  const n = Math.round((max_ - floor_) / h)
+  for (let i = 0; i < n; i++) {
+    const size = floor_ + (i + 0.5) * h
+    add(size, nativeSizePdf(fish, size) * h)
+  }
+  // clamp point masses: floor (rng below) and the native max (rng >= 4)
+  add(floor_, normalCdf(((floor_ - base) * 8) / range))
+  add(max_, 1 - normalCdf(((max_ - base) * 4) / range))
   return out
 }
 
-// Analytical per-cm distribution after the Arise smoothing buff: take the native
-// distribution and push it through the size map.
-export function ariseSizeDistribution(fish) {
-  return remapProbs(analyticalSizeDistribution(fish), (s) => ariseSmoothSize(fish, s))
+// Predicted distribution with native smoothing only (no scaling).
+export function nativeSmoothDistribution(fish) {
+  return mappedSizeDistribution(fish, (s) => ariseSmoothSize(fish, s))
 }
 
-// Predicted per-cm probabilities for a fish, honoring Arise Mardan when on.
-export function predictedProbs(fish, arise) {
-  if (arise && arise.enabled) {
-    return ariseSizeDistribution(fish)
-  }
+// Predicted distribution with the full Arise transform (native smooth + scale +
+// scaled smooth).
+export function ariseSizeDistribution(fish) {
+  return mappedSizeDistribution(fish, (s) => ariseTransform(fish, s))
+}
+
+// Predicted per-cm probabilities for a fish, honoring the mod toggles:
+//   mod.ariseScaling → full Arise (includes native smoothing, regardless of the
+//                      other toggle); mod.smoothNative → native smoothing only.
+export function predictedProbs(fish, mod) {
+  if (mod && mod.ariseScaling) return ariseSizeDistribution(fish)
+  if (mod && mod.smoothNative) return nativeSmoothDistribution(fish)
   return analyticalSizeDistribution(fish)
 }
 
@@ -257,7 +325,7 @@ function effectiveWeight(areaConfig, id, periodIdx) {
 }
 
 // Session simulator: Monte Carlo over N sessions in an area/period.
-export function runSession({ areaName, periodName, numSessions, arise }) {
+export function runSession({ areaName, periodName, numSessions, mod }) {
   const area = AREA_CONFIG[areaName]
   if (!area) return { ok: false, message: 'Area not found: ' + areaName }
   const periodIdx = PERIODS.indexOf(periodName)
@@ -265,7 +333,9 @@ export function runSession({ areaName, periodName, numSessions, arise }) {
   if (isNaN(numSess) || numSess < 1)
     return { ok: false, message: 'Invalid session count' }
 
-  const ariseOn = !!(arise && arise.enabled)
+  const ariseScaling = !!(mod && mod.ariseScaling)
+  const smoothNative = !!(mod && mod.smoothNative)
+  const factor = ariseScaling ? ARISE_SCALE_FACTOR : 1
 
   const sizeByCm = {}
   const spawnCounts = {}
@@ -278,8 +348,11 @@ export function runSession({ areaName, periodName, numSessions, arise }) {
       const fish = FISH_BY_ID[fishId]
       if (!fish) continue
       let size = simulateSlotInit(fish)
-      if (ariseOn) size = ariseSmoothSize(fish, size)
-      const cm = Math.round(size * 10)
+      // Arise always includes native smoothing; the native-smooth toggle only
+      // matters when Arise is off.
+      if (ariseScaling) size = ariseTransform(fish, size)
+      else if (smoothNative) size = ariseSmoothSize(fish, size)
+      const cm = Math.floor(size * 10) // display cm = floor(size*10)
       if (!sizeByCm[fishId]) sizeByCm[fishId] = {}
       if (!spawnCounts[fishId]) spawnCounts[fishId] = 0
       sizeByCm[fishId][cm] = (sizeByCm[fishId][cm] || 0) + 1
@@ -300,9 +373,10 @@ export function runSession({ areaName, periodName, numSessions, arise }) {
     globalMax = -Infinity
   fishIds.forEach((id) => {
     const f = FISH_BY_ID[id]
-    // Smoothing only buffs within [base, max], so the cap stays at the native max.
+    // Arise scaling raises the cap to maxSize * factor; smoothing keeps [min, max].
+    const topSize = f.maxSize * factor
     globalMin = Math.min(globalMin, Math.floor(f.minSize * 10))
-    globalMax = Math.max(globalMax, Math.ceil(f.maxSize * 10))
+    globalMax = Math.max(globalMax, Math.ceil(topSize * 10))
   })
   const labels = []
   for (let cm = globalMin; cm <= globalMax; cm++) labels.push(cm)
@@ -338,35 +412,40 @@ export function runSession({ areaName, periodName, numSessions, arise }) {
     sizeByCm,
     spawnCounts,
     summary,
-    arise: { enabled: ariseOn },
+    mod: { smoothNative, ariseScaling, factor },
   }
 }
 
 // Species simulator: Monte Carlo over N fish of one species.
-export function runSpecies({ fish, numFish, arise }) {
-  const n = parseInt(numFish, 10)
+export function runSpecies({ fish, numFish, mod }) {
+  const n = Math.min(parseInt(numFish, 10), MAX_FISH_SAMPLES)
   if (isNaN(n) || n < 1) return { ok: false, message: 'Invalid fish count' }
 
-  const ariseOn = !!(arise && arise.enabled)
-  const ariseObj = { enabled: ariseOn }
+  const ariseScaling = !!(mod && mod.ariseScaling)
+  const smoothNative = !!(mod && mod.smoothNative)
+  const factor = ariseScaling ? ARISE_SCALE_FACTOR : 1
+  const modObj = { smoothNative, ariseScaling, factor }
 
   const sizes = []
   for (let i = 0; i < n; i++) {
     let s = simulateSlotInit(fish)
-    if (ariseOn) s = ariseSmoothSize(fish, s)
+    // Arise always includes native smoothing; native-smooth toggle only applies
+    // when Arise is off.
+    if (ariseScaling) s = ariseTransform(fish, s)
+    else if (smoothNative) s = ariseSmoothSize(fish, s)
     sizes.push(s)
   }
 
-  // Smoothing only buffs within [base, max], so the range stays [min, max].
+  // Arise scaling raises the cap to maxSize * factor; smoothing keeps [min, max].
   const minCm = Math.floor(fish.minSize * 10)
-  const maxCm = Math.ceil(fish.maxSize * 10)
+  const maxCm = Math.ceil(fish.maxSize * factor * 10)
   const counts = {}
   for (let cm = minCm; cm <= maxCm; cm++) counts[cm] = 0
   sizes.forEach((s) => {
-    const cm = Math.round(s * 10)
+    const cm = Math.floor(s * 10) // display cm = floor(size*10)
     if (cm >= minCm && cm <= maxCm) counts[cm] = (counts[cm] || 0) + 1
   })
-  const countAt = (sizeVal) => counts[Math.round(sizeVal * 10)] || 0
+  const countAt = (sizeVal) => counts[Math.floor(sizeVal * 10)] || 0
 
   const labels = []
   const barData = []
@@ -375,7 +454,7 @@ export function runSpecies({ fish, numFish, arise }) {
     barData.push(counts[cm] || 0)
   }
 
-  const probs = predictedProbs(fish, ariseObj)
+  const probs = predictedProbs(fish, modObj)
   const predData = labels.map((cm) => (probs[cm] || 0) * n)
 
   const sorted = [...sizes].sort((a, b) => a - b)
@@ -387,9 +466,9 @@ export function runSpecies({ fish, numFish, arise }) {
   const minObs = sorted[0]
   const maxObs = sorted[sorted.length - 1]
 
-  // Theoretical anchors (unchanged by smoothing: it stays within [min, max]).
+  // Theoretical anchors. Scaling raises the cap to maxSize * factor.
   const theoMin = fish.minSize
-  const theoMax = fish.maxSize
+  const theoMax = fish.maxSize * factor
   const theoBase = fish.baseSize
 
   const stats = [
@@ -446,7 +525,7 @@ export function runSpecies({ fish, numFish, arise }) {
     barData,
     predData,
     stats,
-    arise: ariseObj,
+    mod: modObj,
   }
 }
 
