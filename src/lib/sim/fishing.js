@@ -100,20 +100,32 @@ export function spawnFish(area, periodIdx) {
 
 // ── Analytical (predicted) size distribution ──────────────────
 
-// IH(12)-6 PDF — normal approximation N(0,1) (exact std for IH(12) is 1.0).
-function ihPdf(x) {
-  return Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI)
+// The rng roll is IH(12) - 6: the sum S of 12 uniform draws, less 6. Exact
+// Irwin–Hall density and distribution; S is symmetric about 6, so each is taken
+// on the nearer half, which keeps the alternating sum's terms small.
+const IH_BINOM = [1, 12, 66, 220, 495, 792, 924, 792, 495, 220, 66, 12, 1]
+const FACT_11 = 39916800
+const FACT_12 = 479001600
+
+export function ihPdf(r) {
+  let x = r + 6
+  if (x <= 0 || x >= 12) return 0
+  if (x > 6) x = 12 - x
+  let sum = 0
+  for (let k = 0; k <= Math.floor(x); k++) sum += (k % 2 ? -1 : 1) * IH_BINOM[k] * (x - k) ** 11
+  return sum / FACT_11
 }
 
-export function normalCdf(x) {
-  const t = 1 / (1 + 0.2316419 * Math.abs(x))
-  const d = 0.3989423 * Math.exp((-x * x) / 2)
-  const p =
-    d *
-    t *
-    (0.3193815 +
-      t * (-0.3565638 + t * (1.7814779 + t * (-1.821256 + t * 1.3302744))))
-  return x >= 0 ? 1 - p : p
+export function ihCdf(r) {
+  let x = r + 6
+  if (x <= 0) return 0
+  if (x >= 12) return 1
+  const upper = x > 6
+  if (upper) x = 12 - x
+  let sum = 0
+  for (let k = 0; k <= Math.floor(x); k++) sum += (k % 2 ? -1 : 1) * IH_BINOM[k] * (x - k) ** 12
+  const below = sum / FACT_12
+  return upper ? 1 - below : below
 }
 
 // Predicted per-cm probability mass for a fish's size distribution.
@@ -129,8 +141,8 @@ export function analyticalSizeDistribution(fish) {
   const rngAtFloor = ((floor_ - base) * 8) / range // negative
   const rngAtMaxUp = ((max_ - base) * 4) / range // positive
 
-  const pFloor = normalCdf(rngAtFloor)
-  const pMax = 1 - normalCdf(rngAtMaxUp)
+  const pFloor = ihCdf(rngAtFloor)
+  const pMax = 1 - ihCdf(rngAtMaxUp)
 
   for (let cm = minCm; cm <= maxCm; cm++) {
     const lo = cm / 10.0
@@ -141,26 +153,14 @@ export function analyticalSizeDistribution(fish) {
     const upLo = Math.max(lo, base)
     const upHi = Math.min(hi, max_)
     if (upHi > upLo) {
-      const rLo = ((upLo - base) * 4) / range
-      const rHi = ((upHi - base) * 4) / range
-      const steps = 20
-      for (let k = 0; k < steps; k++) {
-        const r = rLo + ((rHi - rLo) * (k + 0.5)) / steps
-        p += (ihPdf(r) * (4 / range) * (upHi - upLo)) / steps
-      }
+      p += ihCdf(((upHi - base) * 4) / range) - ihCdf(((upLo - base) * 4) / range)
     }
 
     // Lower segment: size in [floor_, base), rngRoll = (size - base) * 8 / range
     const dnLo = Math.max(lo, floor_)
     const dnHi = Math.min(hi, base)
     if (dnHi > dnLo) {
-      const rLo = ((dnLo - base) * 8) / range
-      const rHi = ((dnHi - base) * 8) / range
-      const steps = 20
-      for (let k = 0; k < steps; k++) {
-        const r = rLo + ((rHi - rLo) * (k + 0.5)) / steps
-        p += (ihPdf(r) * (8 / range) * (dnHi - dnLo)) / steps
-      }
+      p += ihCdf(((dnHi - base) * 8) / range) - ihCdf(((dnLo - base) * 8) / range)
     }
 
     if (lo <= floor_ && floor_ < hi) p += pFloor
@@ -185,9 +185,33 @@ export function analyticalSizeDistribution(fish) {
 // The buff is 0 at base and at max and peaks at t = EXPONENT/(EXPONENT+1). The
 // exponent > 1 gives zero slope at base (f'(base) = 1), so the region just above
 // base isn't stretched — no dip there. Tuned and locked to these constants.
-// Locked constants for smoothing the NATIVE size distribution.
-export const ARISE_STRENGTH = 0.93
+// The native clamp piles every roll past max into the top display cm (the same
+// 8.5 fish in a million for every species), which stands out against the cm
+// below it in proportion to the species' range: 7.9x for Baron Garayan (200 cm),
+// 2.1x for Mardan Garayan (60 cm), 1.3x for Niler (40 cm). So the strength is
+// per species, worked out from the exact IH(12) distribution: the one that leaves
+// the cm just below max holding as many fish as max itself, so every species
+// ramps into its max with no spike or cliff (Baron 0.87, Mardan 0.52, Niler 0.21).
+// Only a clamped roll lands on max, so max is exactly as rare as native: a
+// smoothed size stays 0.01 cm under it (the game's floor(size*10) could
+// otherwise round 15.999999*10 up to 160). Matches the Chronicle port's
+// game.smooth_fish_sizes (port/src/fish.cpp).
 export const ARISE_EXPONENT = 1.2
+
+// 12! * P(S <= x) for x in [2, 3], S the sum of 12 uniform draws. S is symmetric
+// about 6, so this also gives the chance of the top of the roll.
+function ihLowTail(x) {
+  return x ** 12 - 12 * (x - 1) ** 12 + 66 * (x - 2) ** 12
+}
+
+// Smoothing strength for a species spanning `range` (max - base, size units).
+export function smoothStrength(range) {
+  const cm = 0.4 / range // one display cm (0.1 size) in rng units (range/4 per unit)
+  if (!(cm < 1)) return 0
+  const atMax = ihLowTail(2) // rng reaches 4: clamped to max
+  const below = ihLowTail(2 + cm) - atMax // the cm just below max
+  return Math.max(0, 1 - below / atMax)
+}
 
 // Core smoothing buff over an arbitrary [base, max] range: nudges mid/high sizes
 // up toward max to fill the gradient into it, while keeping f(base)=base and
@@ -200,9 +224,13 @@ export function smoothCore(size, base, max, strength, exponent) {
   return size + strength * (max - base) * Math.pow(t, exponent) * (1 - t)
 }
 
-// Native smoothing with the locked constants.
+// Native smoothing with the species' strength.
 export function ariseSmoothSize(fish, size) {
-  return smoothCore(size, fish.baseSize, fish.maxSize, ARISE_STRENGTH, ARISE_EXPONENT)
+  const base = fish.baseSize
+  const max = fish.maxSize
+  if (max <= base || size <= base || size >= max) return size
+  const smoothed = smoothCore(size, base, max, smoothStrength(max - base), ARISE_EXPONENT)
+  return Math.max(size, Math.min(smoothed, max - 0.001))
 }
 
 // ── Arise Mardan scaling ──────────────────────────────────────
@@ -226,7 +254,7 @@ export const ARISE_SCALED_STRENGTH = 0.72 // smoothing applied AFTER scaling
 export const ARISE_SCALED_EXPONENT = 2
 
 // Full Arise transform on a native (already [min,max]-clamped) size:
-//   native smooth (0.93/1.2) → ×2 scale → smooth the scaled range (0.72/2).
+//   native smooth (per-species strength, exponent 1.2) → ×2 scale → smooth the scaled range (0.72/2).
 // The native smooth fills the native gradient; scaling raises the cap to 2×max
 // and spreads the upper range (re-exposing the max clamp lump); the scaled
 // smooth (over [scaledBase, scaledMax]) re-fills the gradient into the new cap.
@@ -239,7 +267,7 @@ export function ariseTransform(fish, size) {
   return smoothCore(s, scaledBase, scaledMax, ARISE_SCALED_STRENGTH, ARISE_SCALED_EXPONENT)
 }
 
-// Native continuous size density (per size unit) at `size`, normal-approx IH.
+// Native continuous size density (per size unit) at `size`, exact IH(12).
 // Excludes the floor/cap clamp point masses (handled separately).
 export function nativeSizePdf(fish, size) {
   const base = fish.baseSize
@@ -282,8 +310,8 @@ function mappedSizeDistribution(fish, mapFn) {
     add(size, nativeSizePdf(fish, size) * h)
   }
   // clamp point masses: floor (rng below) and the native max (rng >= 4)
-  add(floor_, normalCdf(((floor_ - base) * 8) / range))
-  add(max_, 1 - normalCdf(((max_ - base) * 4) / range))
+  add(floor_, ihCdf(((floor_ - base) * 8) / range))
+  add(max_, 1 - ihCdf(((max_ - base) * 4) / range))
   return out
 }
 
