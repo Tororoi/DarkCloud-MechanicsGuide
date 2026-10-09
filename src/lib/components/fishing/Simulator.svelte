@@ -2,8 +2,8 @@
 	import { FISH_DATA, FISH_BY_NAME, AREA_ORDER, PERIODS } from '$lib/data/fish.js';
 	import { hexToRgba } from '$lib/color.js';
 	import {
-		runSession, runSpecies, runFp, normalCdf, predictedProbs,
-		ARISE_STRENGTH, ARISE_EXPONENT, ARISE_SCALE_FACTOR,
+		runSession, runSpecies, runFp, ihCdf, predictedProbs,
+		smoothStrength, ARISE_EXPONENT, ARISE_SCALE_FACTOR,
 		ARISE_SCALED_STRENGTH, ARISE_SCALED_EXPONENT, MAX_FISH_SAMPLES
 	} from '$lib/sim/fishing.js';
 	import { customFish } from '$lib/fishingState.svelte.js';
@@ -43,7 +43,7 @@
 	let fpResult = $state(null);
 
 	// Mod features (romhack). Two independent toggles:
-	//   smoothNative — native smoothing only (0.93/1.2).
+	//   smoothNative — native smoothing only (per-species strength, exponent 1.2).
 	//   ariseScaling — full Arise pipeline (native smooth → ×2 scale → scaled
 	//     smooth 0.72/2). Always includes native smoothing, regardless of the
 	//     smoothNative toggle.
@@ -186,7 +186,7 @@
 			const cap = (ARISE_SCALE_FACTOR * mx).toFixed(1);
 			return `${head}
 				<strong>🛠 Arise Mardan Scaling — native size in, then:</strong><br>
-				1. Smooth native: ${ARISE_STRENGTH}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t)<br>
+				1. Smooth native: ${smoothStrength(r).toFixed(2)}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t)<br>
 				2. Scale ×${ARISE_SCALE_FACTOR} (linear): &times;(1 + (${ARISE_SCALE_FACTOR}&minus;1)&middot;u), u=(size&minus;Min)/(Max&minus;Min) → cap ${cap}<br>
 				3. Smooth scaled: ${ARISE_SCALED_STRENGTH}&middot;(Cap&minus;ScaledBase)&middot;t<sup>${ARISE_SCALED_EXPONENT}</sup>&middot;(1&minus;t)<br>
 				<strong>Effect:</strong> floor unscaled, cap = ${cap} (${ARISE_SCALE_FACTOR}&times;Max), smooth gradient into the cap`;
@@ -194,17 +194,18 @@
 
 		if (mod && mod.smoothNative) {
 			return `${head}
-				<strong>🛠 Smooth Native Fish Size Distribution:</strong> size + ${ARISE_STRENGTH}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t), t=(size&minus;Base)/(Max&minus;Base)<br>
-				<strong>Effect:</strong> fish only get bigger; Max preserved; mid/high sizes buffed up to fill the gradient into Max (no scaling)`;
+				<strong>🛠 Smooth Native Fish Size Distribution:</strong> size + ${smoothStrength(r).toFixed(2)}&middot;(Max&minus;Base)&middot;t<sup>${ARISE_EXPONENT}</sup>&middot;(1&minus;t), t=(size&minus;Base)/(Max&minus;Base), capped 0.01 cm under Max<br>
+				<strong>Strength:</strong> per species, from the range, so the cm below Max holds as many fish as Max<br>
+				<strong>Effect:</strong> fish only get bigger; Max exactly as rare as native; sizes ramp into Max with no spike or cliff (no scaling)`;
 		}
 
 		const rngFloor = (((fl - b) * 8) / r).toFixed(2);
 		const rngMaxUp = (((mx - b) * 4) / r).toFixed(2);
 		return `${head}
 			<strong>Size:</strong> BaseSize + r &times; Range / {4 if r&ge;0, 8 if r&lt;0} &nbsp; clamped to [${fl}, ${mx}]<br>
-			<strong>Floor clamp:</strong> r &lt; ${rngFloor} (P&asymp;${(100 * normalCdf(parseFloat(rngFloor))).toFixed(3)}%)
+			<strong>Floor clamp:</strong> r &lt; ${rngFloor} (P=${(100 * ihCdf(parseFloat(rngFloor))).toFixed(4)}%)
 			&nbsp;&nbsp;
-			<strong>Max clamp:</strong> r &gt; ${rngMaxUp} (P&asymp;${(100 * (1 - normalCdf(parseFloat(rngMaxUp)))).toFixed(3)}%)`;
+			<strong>Max clamp:</strong> r &gt; ${rngMaxUp} (P=${(100 * (1 - ihCdf(parseFloat(rngMaxUp)))).toFixed(4)}%)`;
 	}
 
 	// ── Actions ──
@@ -249,7 +250,7 @@
 {#snippet modControls()}
 	<div class="sim-row arise-row">
 		<span class="mod-tag">🛠 Mod features</span>
-		<label class="arise-label" title="Apply the native size-distribution smoothing (0.93/1.2). Does nothing extra when Arise Mardan Scaling is on.">
+		<label class="arise-label" title="Apply the native size-distribution smoothing (per-species strength, exponent 1.2). Does nothing extra when Arise Mardan Scaling is on.">
 			<input type="checkbox" bind:checked={mod.smoothNative} />
 			Smooth Native Fish Size Distribution
 		</label>
